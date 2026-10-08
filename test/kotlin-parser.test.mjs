@@ -215,3 +215,127 @@ test('kotlin symbol coverage is audited rather than silently skipped', async () 
     assert.match(result.stdout, /심볼 커버리지:\s+3\/3 \(100\.0%\)/);
   });
 });
+
+// Review finding 1. A receiver may be generic or nullable, and an earlier
+// revision matched neither — in the parser or in the coverage scan, because
+// both read the same pattern. Three declarations materialized one node and the
+// run reported 1/1 (100.0%) under --strict-coverage.
+test('generic and nullable extension receivers are materialized', async () => {
+  await withTempWorkspace(async (workspace) => {
+    const { result, fileQuark } = await runOnKotlin(workspace, [
+      'fun <T> List<T>.headOrNull(): T? = firstOrNull()',
+      'fun String?.normalized(): String = this?.trim() ?: ""',
+      'fun Map<String, List<Int>>.pairs(): Int = size',
+      'fun ordinary(): Int = 1',
+      '',
+    ].join('\n'), ['--strict-coverage']);
+
+    assert.equal(result.status, 0, result.stderr);
+    const entries = await listRelativeEntries(fileQuark);
+    const names = entries.filter((e) => e.startsWith('fn__'));
+    assert.equal(names.length, 4, names.join('\n'));
+    assert.ok(names.some((n) => n.endsWith('.headOrNull')), names.join('\n'));
+    assert.ok(names.some((n) => n.endsWith('.normalized')), names.join('\n'));
+    assert.ok(names.some((n) => n.endsWith('.pairs')), names.join('\n'));
+    assert.ok(names.includes('fn__ordinary'), names.join('\n'));
+    assert.match(result.stdout, /심볼 커버리지:\s+4\/4 \(100\.0%\)/);
+  });
+});
+
+// The audit only earns its keep if it can fail where the parser cannot see.
+// A receiver nested three deep is beyond the parser's pattern on purpose here:
+// the permissive scan must still count the declaration and the run must exit
+// non-zero under --strict-coverage. If this test ever starts passing with
+// status 0 because the two patterns were unified again, the audit is blind.
+test('a parser gap the naive scan can see fails strict coverage', async () => {
+  await withTempWorkspace(async (workspace) => {
+    const { result } = await runOnKotlin(workspace, [
+      'fun Map<String, List<Set<Int>>>.flattenAll(): Int = 0',
+      'fun ordinary(): Int = 1',
+      '',
+    ].join('\n'), ['--strict-coverage']);
+
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(result.stderr + result.stdout, /flattenAll/);
+  });
+});
+
+// Review finding 2. parseKotlinFields read every line between the class
+// braces, so a method's local `val` was recorded as a property of the class.
+test('local variables inside a method are not class properties', async () => {
+  await withTempWorkspace(async (workspace) => {
+    const { result, fileQuark } = await runOnKotlin(workspace, [
+      'class Example {',
+      '    val realField: Int = 1',
+      '    private var realCounter: Int = 0',
+      '',
+      '    fun calculate() {',
+      '        val localOnly: Int = 2',
+      '        var counter = 0',
+      '        println(localOnly + counter)',
+      '    }',
+      '}',
+      '',
+    ].join('\n'));
+
+    assert.equal(result.status, 0, result.stderr);
+    const entries = await listRelativeEntries(fileQuark);
+    const fields = entries.filter((e) => /^class__Example\/field__[^/]+$/.test(e));
+    assert.deepEqual(
+      fields.sort(),
+      ['class__Example/field__realCounter', 'class__Example/field__realField'],
+      fields.join('\n'),
+    );
+  });
+});
+
+// Review finding 3. A header that completes without `{` on its own line is not
+// bodyless: Kotlin permits the brace on the next line. Closing on sight made
+// the class empty and reparented its members as siblings, and cost a function
+// its entire body while leaking that body's locals to file level.
+test('a declaration whose opening brace is on the next line keeps its body', async () => {
+  await withTempWorkspace(async (workspace) => {
+    const { result, fileQuark } = await runOnKotlin(workspace, [
+      'class Service',
+      '{',
+      '    fun run() {',
+      '        work()',
+      '    }',
+      '}',
+      '',
+      'fun compute(a: Int): Int',
+      '// a comment between the header and its block',
+      '{',
+      '    val doubled = a * 2',
+      '    return doubled',
+      '}',
+      '',
+    ].join('\n'));
+
+    assert.equal(result.status, 0, result.stderr);
+    const entries = await listRelativeEntries(fileQuark);
+    assert.ok(entries.includes('class__Service/fn__run'), entries.join('\n'));
+    assert.ok(!entries.includes('fn__run'), `fn__run must not be a file-level sibling:\n${entries.join('\n')}`);
+    assert.ok(entries.some((e) => e.startsWith('fn__compute/stmt_')), entries.join('\n'));
+    assert.ok(!entries.includes('var__doubled'), `a local must not leak to file level:\n${entries.join('\n')}`);
+  });
+});
+
+// The lookahead must not reclaim an expression body whose value happens to
+// start on the following line.
+test('an expression body spanning lines still closes at its declaration', async () => {
+  await withTempWorkspace(async (workspace) => {
+    const { result, fileQuark } = await runOnKotlin(workspace, [
+      'fun first(): Int =',
+      '    1 + 2',
+      '',
+      'fun second(): Int = 3',
+      '',
+    ].join('\n'));
+
+    assert.equal(result.status, 0, result.stderr);
+    const entries = await listRelativeEntries(fileQuark);
+    assert.ok(entries.includes('fn__first'), entries.join('\n'));
+    assert.ok(entries.includes('fn__second'), entries.join('\n'));
+  });
+});

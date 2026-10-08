@@ -242,12 +242,20 @@ const KOTLIN_MODIFIERS =
   'suspend|inline|noinline|crossinline|operator|infix|tailrec|external|' +
   'expect|actual|const|lateinit|annotation|data|value|inner|companion)';
 
-// Shared by the parser and the independent coverage scan. They must agree on
-// what a function is *named* or the audit reports gaps that do not exist —
-// so the sub-pattern lives in exactly one place. An extension function keeps
-// its receiver (`Region.toDto`) to stop same-named extensions on different
-// receivers from merging into one folder.
-const KOTLIN_FUN_NAME = '(?:<[^>]+>\\s*)?((?:[a-zA-Z_][a-zA-Z0-9_]*\\.)?[a-zA-Z_][a-zA-Z0-9_]*)';
+// The parser's own function-name pattern. An extension function keeps its
+// receiver (`Region.toDto`) so that same-named extensions on different
+// receivers do not merge into one folder, and a receiver may itself be
+// generic (`List<T>`), nullable (`String?`), or qualified (`kotlin.text.Regex`).
+//
+// This pattern is deliberately NOT shared with NAIVE_SYMBOL_SCANS. An earlier
+// revision did share it, reasoning that the two must agree on a function's
+// name or the audit would report gaps that are not real. That reasoning
+// inverted the audit's purpose: a receiver form neither pattern accepted was
+// then invisible to both, so a file with three functions materialized one and
+// reported 1/1 (100.0%). The audit must be able to be wrong in a direction the
+// parser is not, which means it must scan independently.
+const KOTLIN_RECEIVER = '(?:[a-zA-Z_][a-zA-Z0-9_]*(?:\\s*<[^<>]*(?:<[^<>]*>)?[^<>]*>)?\\s*\\??\\s*\\.\\s*)*';
+const KOTLIN_FUN_NAME = `(?:<[^>]+>\\s*)?(${KOTLIN_RECEIVER}[a-zA-Z_][a-zA-Z0-9_]*)`;
 
 // ─── PTX arg 의미 분류 (PTX Argument Classification) ───
 function classifyPtxArg(raw, opcode) {
@@ -302,14 +310,28 @@ function parseJavaFields(body) {
 // a `var` field is the mutable state you actually have to reason about.
 function parseKotlinFields(body) {
   const fields = [];
+  // `body` is everything between the container's braces, function bodies
+  // included. Without a depth counter a method's local `val` is recorded as a
+  // property of the enclosing class, which inflates the class's apparent state
+  // and corrupts any count taken from the `mutability__` nodes. Only depth 0 —
+  // the container's own body — declares properties.
+  let depth = 0;
+  const pattern = new RegExp(
+    `^(?:${KOTLIN_MODIFIERS}\\s+)*(val|var)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?::\\s*([^=]+?))?\\s*(?:=\\s*(.+?)|by\\s+(.+?))?\\s*$`,
+  );
   for (const raw of body.split('\n')) {
     const l = raw.replace(/\/\/.*/g, '').trim();
-    if (!l) continue;
+    const code = l.replace(/"(?:[^"\\]|\\.)*"/g, '').replace(/'(?:[^'\\]|\\.)*'/g, '');
+    const opens = (code.match(/\{/g) || []).length;
+    const closes = (code.match(/\}/g) || []).length;
+    // A property declared on a line that also opens a block (`val x = run {`)
+    // still belongs to this container, so the depth is raised only afterwards.
+    const depthHere = depth;
+    depth += opens - closes;
+    if (depthHere !== 0 || !l) continue;
     // `for (item in xs)` and destructuring both start with val/var but are not
     // properties; a delegated property (`by lazy { … }`) is.
-    const m = l.match(
-      new RegExp(`^(?:${KOTLIN_MODIFIERS}\\s+)*(val|var)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?::\\s*([^=]+?))?\\s*(?:=\\s*(.+?)|by\\s+(.+?))?\\s*$`),
-    );
+    const m = l.match(pattern);
     if (!m) continue;
     fields.push({
       name: m[2].trim(),
@@ -1496,8 +1518,25 @@ class QuarkFolderEngine {
     '.cjs': /\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g,
     '.ts': /\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g,
     '.rb': /^[ \t]*def\s+(?:self\.)?([A-Za-z_][A-Za-z0-9_]*[?!=]?)/gm,
-    '.kt': new RegExp(`\\bfun\\s+${KOTLIN_FUN_NAME}\\s*\\(`, 'g'),
-    '.kts': new RegExp(`\\bfun\\s+${KOTLIN_FUN_NAME}\\s*\\(`, 'g'),
+    // Deliberately blind to receivers: take whatever identifier sits directly
+    // before the parameter list. Sharing the parser's receiver pattern here is
+    // what let `fun <T> List<T>.headOrNull()` vanish from both sides at once.
+    '.kt': /\bfun\b[^(\n]*?([A-Za-z_][A-Za-z0-9_]*)\s*\(/g,
+    '.kts': /\bfun\b[^(\n]*?([A-Za-z_][A-Za-z0-9_]*)\s*\(/g,
+  };
+
+  // How a scanned name is matched against the folder names actually built.
+  // The default is exact equality; a language whose parser encodes more into
+  // the folder name than the naive scan can see declares a comparison here.
+  static SYMBOL_FOLDER_MATCHERS = {
+    // The parser names an extension function after its receiver
+    // (`List<T>.headOrNull` becomes the folder `List_T_.headOrNull`), while
+    // the scan above sees only `headOrNull`. Comparing final segments keeps
+    // the audit ignorant of receiver spelling, which is precisely the thing it
+    // must not learn from the parser, without reporting every extension
+    // function as a gap.
+    '.kt': (name, built) => [...built].some((b) => b.split('.').pop() === name),
+    '.kts': (name, built) => [...built].some((b) => b.split('.').pop() === name),
   };
 
   // A language whose method names carry characters safeName() flattens must
@@ -1550,10 +1589,9 @@ class QuarkFolderEngine {
     for (const file of this.expectedSymbols) {
       const built = collectFnNames(path.join(this.quarkDir, file.fileFolderName));
       const encode = QuarkFolderEngine.FOLDER_NAME_ENCODERS[file.ext] || ((n) => n);
-      const missing = [...file.names].filter((name) => {
-        const folder = encode(name);
-        return !built.has(safeName(folder)) && !built.has(folder);
-      });
+      const matches = QuarkFolderEngine.SYMBOL_FOLDER_MATCHERS[file.ext] ||
+        ((name, names) => names.has(safeName(name)) || names.has(name));
+      const missing = [...file.names].filter((name) => !matches(encode(name), built));
       expected += file.names.size;
       matched += file.names.size - missing.length;
       if (missing.length) gaps.push({ relPath: file.relPath, missing });
@@ -1759,6 +1797,32 @@ class QuarkFolderEngine {
     // or from no body at all (`class Foo(val a: Int)`).
     const isKotlin = KOTLIN_EXTENSIONS.has(ext);
     const parenDelta = (s) => (s.match(/\(/g) || []).length - (s.match(/\)/g) || []).length;
+    // A header that completes without `{` on its own line is not necessarily
+    // bodyless: Kotlin allows the opening brace on the following line. Closing
+    // the symbol on sight made `class Service\n{` emit an empty class and
+    // reparent its members as siblings, and cost a function its whole body
+    // while leaking that body's locals to file level. Blank lines and comments
+    // may sit in between, so look past them before deciding.
+    const opensBlockAhead = (from) => {
+      let inBlockComment = false;
+      for (let j = from; j < lines.length; j++) {
+        let t = lines[j].trim();
+        if (inBlockComment) {
+          const end = t.indexOf('*/');
+          if (end < 0) continue;
+          t = t.slice(end + 2).trim();
+          inBlockComment = false;
+        }
+        while (t.startsWith('/*')) {
+          const end = t.indexOf('*/', 2);
+          if (end < 0) { inBlockComment = true; t = ''; break; }
+          t = t.slice(end + 2).trim();
+        }
+        if (!t || t.startsWith('//')) continue;
+        return t.startsWith('{');
+      }
+      return false;
+    };
     let awaitingSignature = false;
     let signatureDepth = 0;
 
@@ -1963,10 +2027,11 @@ class QuarkFolderEngine {
           }
           if (cur.kind === 'var' && line.includes(';')) finishSymbol(i + 1);
           else if (openedOnce && depth <= 0) finishSymbol(i + 1);
-          // Kotlin, signature complete on this line, no `{` opened: an
-          // expression body or a bodyless declaration. Nothing further belongs
-          // to this symbol, and waiting for a brace would swallow the file.
-          else if (isKotlin && !awaitingSignature && !openedOnce) finishSymbol(i + 1);
+          // Kotlin, signature complete on this line, no `{` opened and none on
+          // the next meaningful line: an expression body or a bodyless
+          // declaration. Nothing further belongs to this symbol, and waiting
+          // for a brace that never comes would swallow the file.
+          else if (isKotlin && !awaitingSignature && !openedOnce && !opensBlockAhead(i + 1)) finishSymbol(i + 1);
         }
       } else {
         depth += openers - closers;
@@ -1975,7 +2040,9 @@ class QuarkFolderEngine {
           signatureDepth += parenDelta(stripped);
           if (signatureDepth <= 0) {
             awaitingSignature = false;
-            if (!openedOnce) { finishSymbol(i + 1); continue; }
+            // Same lookahead as above: a multi-line signature may also place
+            // its opening brace on the line after the closing paren.
+            if (!openedOnce && !opensBlockAhead(i + 1)) { finishSymbol(i + 1); continue; }
           }
         }
         if (cur.kind === 'var' && line.includes(';')) finishSymbol(i + 1);
